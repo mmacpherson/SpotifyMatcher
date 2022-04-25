@@ -1,8 +1,11 @@
+import datetime
 import itertools
 import os
+import time
 
 import click
 import mutagen
+import spotipy
 from loguru import logger
 
 # import sys
@@ -10,8 +13,6 @@ from loguru import logger
 # from time import sleep
 
 
-# import spotipy
-# from spotipy import oauth2
 # from tinytag import TinyTag
 
 # def get_user_data():
@@ -28,23 +29,51 @@ from loguru import logger
 #         sys.exit()
 
 
-# def connect_to_spotify(username, scope):
-#     """Used to obtain the auth_manager and establish a connection to Spotify
-#     for the given user.
-#     Returns (Spotify object, auth_manager)"""
-#     auth_manager = oauth2.SpotifyOAuth(
-#         client_id="",
-#         client_secret="",
-#         redirect_uri="https://localhost/",
-#         scope=scope,
-#         username=username,
-#     )
+def chunk(items, size):
+    if len(items) <= size:
+        return [items]
 
-#     if auth_manager:
-#         return (spotipy.Spotify(auth_manager=auth_manager), auth_manager)
+    return [items[:size]] + chunk(items[size:], size)
 
-#     print(f"Can't get token for {username}")
-#     sys.exit()
+
+def dig(obj, *keys, error=True):
+    keys = list(keys)
+    if isinstance(keys[0], list):
+        return dig(obj, *keys[0], error=error)
+
+    if (
+        isinstance(obj, dict)
+        and keys[0] in obj
+        or isinstance(obj, list)
+        and keys[0] < len(obj)
+    ):
+        if len(keys) == 1:
+            return obj[keys[0]]
+        return dig(obj[keys[0]], *keys[1:], error=error)
+
+    if hasattr(obj, keys[0]):
+        if len(keys) == 1:
+            return getattr(obj, keys[0])
+        return dig(getattr(obj, keys[0]), *keys[1:], error=error)
+
+    if error:
+        raise KeyError(keys[0])
+
+    return None
+
+
+def connect_to_spotify(username, scope):
+    """Used to obtain the auth_manager and establish a connection to Spotify
+    for the given user.
+    Returns (Spotify object, auth_manager)"""
+    auth_manager = spotipy.oauth2.SpotifyOAuth(
+        scope=scope,
+        username=username,
+    )
+
+    spotify = spotipy.Spotify(auth_manager=auth_manager)
+
+    return spotify, auth_manager
 
 
 # def get_auth_token(auth_manager):
@@ -105,6 +134,91 @@ def load_track_metadata(music_dir):
     return tags
 
 
+def expand_spotify_albums(spotify, albums):
+
+    track_ids = []
+    for album in sorted(albums, key=lambda e: e[-1]):
+
+        album_title, artist, date = album
+
+        album_title = album_title[0]
+        artist = artist[0]
+
+        album_result = spotify.search(
+            q=f"artist:{artist} album:{album_title}", type="album"
+        )
+
+        nhits = dig(album_result, "albums", "total")
+        if nhits == 0:
+            logger.info(f"No hits for album [{album}].")
+            continue
+
+        if nhits > 1:
+            logger.info(f"Multiple hits for album [{album}].")
+            continue
+
+        # Look up tracks on matching album.
+        track_ids.extend(
+            [
+                e["id"]
+                for e in spotify.album_tracks(
+                    dig(album_result, "albums", "items", 0, "id")
+                )["items"]
+            ]
+        )
+
+    return track_ids
+
+
+def match_spotify_tracks(spotify, tracks):
+
+    track_ids = []
+    for track in tracks:
+
+        try:
+            track_result = spotify.search(q=f"{dig(track, 'title', 0)}", type="track")
+        except KeyError:
+            logger.info(f"No title available for track [{track}].")
+            continue
+
+        nhits = dig(track_result, "tracks", "total")
+        if nhits == 0:
+            logger.info(f"No hits for track [{track}].")
+            continue
+
+        if nhits > 1:
+            logger.info(f"Multiple hits for track [{track}].")
+            continue
+
+        track_ids.append(dig(track_result, "tracks", "items", 0, "id"))
+
+    return track_ids
+
+
+def create_spotify_playlist(
+    spotify, username, track_ids, playlist_id="", batch_size=50
+):
+
+    if not playlist_id:
+        date = datetime.datetime.now().strftime(
+            "%d %b %Y at %H:%M"
+        )  # 1 Jan 2020 at 13:30
+        playlist_id = spotify.user_playlist_create(
+            username,
+            "SpotifyMatcher",
+            public=False,
+            description=f"Playlist automatically created by SpotifyMatcher on {date}.",
+        )["id"]
+
+    for _ids in chunk(track_ids, batch_size):
+
+        spotify.user_playlist_add_tracks(username, playlist_id, _ids)
+
+        time.sleep(0.25)
+
+    return playlist_id
+
+
 # def ensure_playlist_exists(playlist_id):
 #     try:
 #         if not playlist_id:
@@ -156,35 +270,9 @@ def load_track_metadata(music_dir):
 #             del track_ids[:spotify_limit]
 
 
-def dig(obj, *keys, error=True):
-    keys = list(keys)
-    if isinstance(keys[0], list):
-        return dig(obj, *keys[0], error=error)
-
-    if (
-        isinstance(obj, dict)
-        and keys[0] in obj
-        or isinstance(obj, list)
-        and keys[0] < len(obj)
-    ):
-        if len(keys) == 1:
-            return obj[keys[0]]
-        return dig(obj[keys[0]], *keys[1:], error=error)
-
-    if hasattr(obj, keys[0]):
-        if len(keys) == 1:
-            return getattr(obj, keys[0])
-        return dig(getattr(obj, keys[0]), *keys[1:], error=error)
-
-    if error:
-        raise KeyError(keys[0])
-
-    return None
-
-
 @click.command()
+@click.argument("username")
 @click.argument("music_dir", type=click.Path(exists=True))
-@click.option("-u", "--username", default="")
 @click.option("-p", "--playlist-id", default="")
 @click.option("-s", "--use-spotify", is_flag=True, default=False)
 @click.option("--spotify-scope", default="playlist-modify-public user-library-modify")
@@ -192,8 +280,8 @@ def dig(obj, *keys, error=True):
     "-f", "--failed-matches-filename", default="spotify-matcher.log", type=click.Path()
 )
 def main(
-    music_dir,
     username,
+    music_dir,
     playlist_id,
     use_spotify,
     spotify_scope,
@@ -211,14 +299,19 @@ def main(
         f"leaving [{len(tracks)}] tracks not associated with albums."
     )
 
-    print(tracks)
-
     if not use_spotify:
         return
 
-    # sp = None
-    # if spotify:
-    #     sp, auth_manager = connect_to_spotify(username, scope)
+    spotify, auth_manager = connect_to_spotify(username, spotify_scope)
+
+    # Search spotify for discovered albums.
+    playlist_track_ids = expand_spotify_albums(spotify, albums) + match_spotify_tracks(
+        spotify, tracks
+    )
+
+    create_spotify_playlist(
+        spotify, username, playlist_track_ids, playlist_id=playlist_id
+    )
 
     #     # Needed to get the cached authentication if missing
     #     dummy_search = sp.search("whatever", limit=1)
