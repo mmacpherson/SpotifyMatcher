@@ -1,9 +1,14 @@
-# import os
+import itertools
+import os
+
+import click
+import mutagen
+from loguru import logger
+
 # import sys
 # from datetime import datetime
 # from time import sleep
 
-import click
 
 # import spotipy
 # from spotipy import oauth2
@@ -51,57 +56,53 @@ import click
 #     return auth_manager.get_access_token(as_dict=True)
 
 
-# def get_title_and_artist(music_dir):
-#     """Recursively reads local files in indicated music_dir.
+def album_info(track: dict):
+    return (
+        track.get("album", []),
+        track.get("artist", []),
+        # track.get("albumartist", []),
+        track.get("date", []),
+    )
 
-#     Yields a string '{song} - {artist}'.
-#     """
-#     if len(music_dir) == 0 or not os.path.isdir(music_dir):
-#         while True:
-#             music_dir = input("Please paste the path to your music directory:")
 
-#             if os.path.isdir(music_dir):
-#                 break
+def cluster_albums(tracks, min_tracks=3, same_album_fn=album_info):
 
-#             print(
-#                 "The provided path is not valid. Please try again or type "
-#                 "in the path directly into the source code if there's "
-#                 "issues\n(use Ctrl + C to exit the program)"
-#             )
-#     else:
-#         print(f"Found valid path. Commencing search in {music_dir}")
+    # We guess that a collection "has an album" if it has {min_tracks} tracks
+    # from a given album.
+    matched_albums = [
+        album
+        for album, album_tracks in itertools.groupby(
+            (e for e in sorted(tracks, key=same_album_fn) if "album" in e),
+            key=same_album_fn,
+        )
+        if len(list(album_tracks)) > min_tracks
+    ]
 
-#     files_read = 0
-#     for subdir, _, files in os.walk(music_dir):
-#         for file in files:
-#             try:
-#                 audiofile = TinyTag.get(os.path.join(subdir, file))
-#             except ValueError:
-#                 continue
+    unmatched_tracks = [
+        track for track in tracks if same_album_fn(track) not in matched_albums
+    ]
 
-#             files_read += 1
-#             yield (
-#                 f"track:{audiofile.title} artist:{audiofile.artist}",
-#                 f"{audiofile.artist} - {audiofile.title}",
-#             )
-#             # NOTE: Query being in double quotes makes it stick to the
-#             # given word order instead of matching a bunch of possibilities
-#             # Use it (by writing \" at the beginning and end of the string)
-#             # if you are not happy with the matches found
+    return matched_albums, unmatched_tracks
 
-#     if files_read == 0:
-#         print(
-#             "\nNo files found at the specified location."
-#             "Please check the path to the directory is correct."
-#         )
-#         sys.exit()
 
-#     print(
-#         f"\nRead {files_read} files. Make sure to check for any possible "
-#         'unread files due to "Lame tag CRC check failed" or similar.\n'
-#         "Those come from an external library and this software cannot "
-#         "account for them"
-#     )
+def load_track_metadata(music_dir):
+    """Recursively reads local files in indicated music_dir.
+
+    Yields a string '{song} - {artist}'.
+    """
+
+    tags = []
+    for subdir, _, files in os.walk(music_dir):
+        for fn in files:
+            try:
+                audio_info = dict(mutagen.File(f"{subdir}/{fn}", easy=True))
+            except TypeError:
+                # logger.debug(f"Failed to load [{fn}]")
+                pass
+
+            tags.append(audio_info)
+
+    return tags
 
 
 # def ensure_playlist_exists(playlist_id):
@@ -155,49 +156,65 @@ import click
 #             del track_ids[:spotify_limit]
 
 
-# def dig(obj, *keys, error=True):
-#     keys = list(keys)
-#     if isinstance(keys[0], list):
-#         return dig(obj, *keys[0], error=error)
+def dig(obj, *keys, error=True):
+    keys = list(keys)
+    if isinstance(keys[0], list):
+        return dig(obj, *keys[0], error=error)
 
-#     if (
-#         isinstance(obj, dict)
-#         and keys[0] in obj
-#         or isinstance(obj, list)
-#         and keys[0] < len(obj)
-#     ):
-#         if len(keys) == 1:
-#             return obj[keys[0]]
-#         return dig(obj[keys[0]], *keys[1:], error=error)
+    if (
+        isinstance(obj, dict)
+        and keys[0] in obj
+        or isinstance(obj, list)
+        and keys[0] < len(obj)
+    ):
+        if len(keys) == 1:
+            return obj[keys[0]]
+        return dig(obj[keys[0]], *keys[1:], error=error)
 
-#     if hasattr(obj, keys[0]):
-#         if len(keys) == 1:
-#             return getattr(obj, keys[0])
-#         return dig(getattr(obj, keys[0]), *keys[1:], error=error)
+    if hasattr(obj, keys[0]):
+        if len(keys) == 1:
+            return getattr(obj, keys[0])
+        return dig(getattr(obj, keys[0]), *keys[1:], error=error)
 
-#     if error:
-#         raise KeyError(keys[0])
+    if error:
+        raise KeyError(keys[0])
 
-#     return None
+    return None
 
 
 @click.command()
 @click.argument("music_dir", type=click.Path(exists=True))
-@click.option("-u", "--username", default="mmac77")
+@click.option("-u", "--username", default="")
 @click.option("-p", "--playlist-id", default="")
-@click.option("-s", "--spotify", is_flag=True, default=False)
+@click.option("-s", "--use-spotify", is_flag=True, default=False)
+@click.option("--spotify-scope", default="playlist-modify-public user-library-modify")
 @click.option(
     "-f", "--failed-matches-filename", default="spotify-matcher.log", type=click.Path()
 )
-def main(music_dir, username, playlist_id, spotify, failed_matches_filename):
-    pass
-    # scope = "playlist-modify-public user-library-modify"
-    # music_dir = ""
-    # music_dir = "/storage/music"
-    # Write the dirpath directly here to avoid having to do it through terminal.
-    # Make sure to escape backslashes. Examples:
-    # 'C:/Users/John/Music/My Music'
-    # "C:\\Users\\John\\Music\\My Music"
+def main(
+    music_dir,
+    username,
+    playlist_id,
+    use_spotify,
+    spotify_scope,
+    failed_matches_filename,
+):
+
+    logger.info(f"Searching path: {music_dir}")
+
+    tracks = load_track_metadata(music_dir)
+    logger.info(f"Discovered [{len(tracks)}] music files.")
+
+    albums, tracks = cluster_albums(tracks)
+    logger.info(
+        f"Discovered [{len(albums)}] albums, "
+        f"leaving [{len(tracks)}] tracks not associated with albums."
+    )
+
+    print(tracks)
+
+    if not use_spotify:
+        return
 
     # sp = None
     # if spotify:
