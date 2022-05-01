@@ -2,6 +2,7 @@ import datetime
 import functools
 import itertools
 import os
+import shutil
 import time
 from difflib import SequenceMatcher
 
@@ -101,7 +102,7 @@ def cluster_albums(tracks, min_tracks=3, same_album_fn=album_info):
 
 def is_plausible_music_file(fname):
 
-    notmusic_extensions = {".ini", ".jpg", ".bmp", ".m3u", ".db"}
+    notmusic_extensions = {".ini", ".jpg", ".bmp", ".m3u", ".db", ".txt"}
     return not any(fname.endswith(e) for e in notmusic_extensions)
 
 
@@ -377,6 +378,31 @@ def create_spotify_playlist(
     return playlist_id
 
 
+def get_unmatched_track_ids(df):
+    return ~df.groupby("discovery_id").apply(
+        lambda f: (f.album_matched | f.nonalbum_track_matched).any()
+    )
+
+
+def copy_unmatched_tracks(tracks_df, music_dir, unmatched_tracks_dir):
+
+    unmatched_track_ids = get_unmatched_track_ids(tracks_df)
+    unmatched_track_ids = unmatched_track_ids[unmatched_track_ids]
+
+    for row in tracks_df.loc[
+        lambda f: f.discovery_id.isin(unmatched_track_ids.index)
+    ].itertuples():
+
+        from_path = row.path
+        to_path = from_path.replace(music_dir, unmatched_tracks_dir)
+
+        to_dir = os.path.dirname(to_path)
+        if not os.path.exists(to_dir):
+            os.makedirs(to_dir)
+
+        shutil.copy2(from_path, to_path)
+
+
 @click.command()
 @click.argument("username")
 @click.argument("music_dir", type=click.Path(exists=True))
@@ -384,16 +410,22 @@ def create_spotify_playlist(
 @click.option("-s", "--use-spotify", is_flag=True, default=False)
 @click.option("--spotify-scope", default="playlist-modify-public user-library-modify")
 @click.option(
-    "-f", "--failed-matches-filename", default="spotify-matcher.log", type=click.Path()
+    "-f", "--matches-filename", default="spotify-track-matches.csv", type=click.Path()
 )
+@click.option("-u", "--unmatched-tracks-dir", default=None, type=click.Path())
 def main(
     username,
     music_dir,
     playlist_id,
     use_spotify,
     spotify_scope,
-    failed_matches_filename,
+    matches_filename,
+    unmatched_tracks_dir,
 ):
+
+    # Guard against trailing slashes.
+    music_dir = music_dir.rstrip("/")
+    unmatched_tracks_dir = unmatched_tracks_dir.rstrip("/")
 
     logger.info(f"Searching path: {music_dir}")
 
@@ -401,6 +433,10 @@ def main(
     logger.info(f"Discovered [{len(tracks)}] music files.")
 
     if not use_spotify:
+        logger.info(
+            "Exiting without connecting to spotify, because "
+            "`-s/--use-spotify` was set to False."
+        )
         return
 
     spotify = connect_to_spotify(username, spotify_scope)
@@ -421,17 +457,19 @@ def main(
         f"Found [{len(tracks_df.loc[lambda f: f.nonalbum_track_matched])}]"
         " matching tracks outside albums."
     )
-    num_unmatched = sum(
-        ~tracks_df.groupby("discovery_id").apply(
-            lambda f: (f.album_matched | f.nonalbum_track_matched).any()
-        )
+    logger.info(
+        f"That leaves [{sum(get_unmatched_track_ids(tracks_df))}] unmatched tracks."
     )
-    logger.info(f"That leaves [{num_unmatched}] unmatched tracks.")
 
-    tracks_df.to_csv("matched-tracks.csv", index=False)
+    # Save off matches log.
+    tracks_df.to_csv(matches_filename, index=False)
 
-    # Take tracks that match at spotify, but are not associated with an album.
+    # Create playlist.
     create_spotify_playlist(spotify, username, tracks_df, playlist_id=playlist_id)
+
+    # Copy unmatched tracks.
+    if unmatched_tracks_dir is not None:
+        copy_unmatched_tracks(tracks_df, music_dir, unmatched_tracks_dir)
 
 
 if __name__ == "__main__":
