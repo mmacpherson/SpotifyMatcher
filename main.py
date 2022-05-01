@@ -1,10 +1,13 @@
 import datetime
+import functools
 import itertools
 import os
 import time
+from difflib import SequenceMatcher
 
 import click
 import mutagen
+import pandas as pd
 import spotipy
 from loguru import logger
 
@@ -62,6 +65,12 @@ def dig(obj, *keys, error=True):
     return None
 
 
+def similarity(a, b):
+    return (
+        SequenceMatcher(None, a, b).ratio() + SequenceMatcher(None, b, a).ratio()
+    ) / 2
+
+
 def connect_to_spotify(username, scope):
     """Used to obtain the auth_manager and establish a connection to Spotify
     for the given user.
@@ -87,10 +96,10 @@ def connect_to_spotify(username, scope):
 
 def album_info(track: dict):
     return (
-        track.get("album", []),
-        track.get("artist", []),
-        # track.get("albumartist", []),
-        track.get("date", []),
+        track.get("album", ""),
+        track.get("artist", ""),
+        # track.get("albumartist", None),
+        track.get("date", ""),
     )
 
 
@@ -99,19 +108,38 @@ def cluster_albums(tracks, min_tracks=3, same_album_fn=album_info):
     # We guess that a collection "has an album" if it has {min_tracks} tracks
     # from a given album.
     matched_albums = [
-        album
-        for album, album_tracks in itertools.groupby(
-            (e for e in sorted(tracks, key=same_album_fn) if "album" in e),
-            key=same_album_fn,
+        (album, album_tracks)
+        for album, album_tracks in (
+            (album, list(album_tracks))
+            for album, album_tracks in itertools.groupby(
+                (e for e in sorted(tracks, key=same_album_fn) if "album" in e),
+                key=same_album_fn,
+            )
         )
-        if len(list(album_tracks)) > min_tracks
+        if len(album_tracks) > min_tracks
     ]
 
     unmatched_tracks = [
-        track for track in tracks if same_album_fn(track) not in matched_albums
+        track
+        for track in tracks
+        if same_album_fn(track) not in [a for (a, b) in matched_albums]
     ]
 
     return matched_albums, unmatched_tracks
+
+
+def is_plausible_music_file(fname):
+
+    notmusic_extensions = {".ini", ".jpg", ".bmp", ".m3u", ".db"}
+    return not any(fname.endswith(e) for e in notmusic_extensions)
+
+
+def collapse_singletons(info):
+
+    return {
+        k: v[0] if (isinstance(v, list) and (len(v) == 1)) else ",".join(map(str, v))
+        for (k, v) in info.items()
+    }
 
 
 def load_track_metadata(music_dir):
@@ -120,24 +148,39 @@ def load_track_metadata(music_dir):
     Yields a string '{song} - {artist}'.
     """
 
-    tags = []
+    fields_to_keep = {"discovery_id", "album", "title", "artist", "date", "path"}
+
+    discovery_id = 0
+    tracks = []
     for subdir, _, files in os.walk(music_dir):
         for fn in files:
+            if not is_plausible_music_file(fn):
+                continue
             try:
-                audio_info = dict(mutagen.File(f"{subdir}/{fn}", easy=True))
+                path = f"{subdir}/{fn}"
+                audio_info = dict(mutagen.File(path, easy=True))
             except TypeError:
-                # logger.debug(f"Failed to load [{fn}]")
+                logger.debug(f"Failed to load [{fn}] with TypeError.")
+                pass
+            except Exception as e:
+                logger.debug(f"Failed to load [{fn}] with exception [{e}].")
                 pass
 
-            tags.append(audio_info)
+            track = {"discovery_id": discovery_id, "path": path} | collapse_singletons(
+                audio_info
+            )
+            track = {k: v for k, v in track.items() if k in fields_to_keep}
+            tracks.append(track)
 
-    return tags
+            discovery_id += 1
+
+    return tracks
 
 
 def expand_spotify_albums(spotify, albums):
 
     track_ids = []
-    for album in sorted(albums, key=lambda e: e[-1]):
+    for album, album_tracks in sorted(albums, key=lambda e: e[0][-1]):
 
         album_title, artist, date = album
 
@@ -195,8 +238,139 @@ def match_spotify_tracks(spotify, tracks):
     return track_ids
 
 
+SEARCH_PAIRS = (
+    ("title", "track", 1),
+    ("artist", "artist", 0.5),
+    ("album", "album", 0.5),
+    # ("date", "year"),
+)
+
+
+def spotify_artists_to_string(artists):
+    return ",".join(e["name"] for e in artists)
+
+
+def spotify_process_track(spotify_hit):
+
+    return dict(
+        album=dig(spotify_hit, "album", "name"),
+        album_id=dig(spotify_hit, "album", "id"),
+        track_id=spotify_hit["id"],
+        track=spotify_hit["name"],
+        popularity=spotify_hit["popularity"],
+        artist=spotify_artists_to_string(spotify_hit["artists"]),
+    )
+
+
+def track_similarity(track, spotify_hit, search_pairs=SEARCH_PAIRS):
+
+    numerator, denominator = 0, 0
+    for (q, s, w) in search_pairs:
+        if q not in track:
+            continue
+        if s not in spotify_hit:
+            continue
+        numerator += w * similarity(track[q], spotify_hit[s])
+        denominator += w
+
+    return numerator / denominator
+
+
+def spotify_match_track(spotify, track, search_pairs=SEARCH_PAIRS):
+
+    search_clauses = []
+    for (q, s, _) in search_pairs:
+        if q not in track:
+            continue
+        search_clauses += [f"{s}:{track[q]}"]
+
+    query = " ".join(search_clauses).strip()
+
+    if not query:
+        return []
+
+    return sorted(
+        (
+            e | {"similarity": track_similarity(track, e)}
+            for e in (
+                spotify_process_track(t)
+                for t in dig(spotify.search(q=query, type="track"), "tracks", "items")
+            )
+        ),
+        key=lambda e: (-1.0 * e["similarity"], -1.0 * e["popularity"]),
+    )
+
+
+def spotify_batch_match_tracks(spotify, tracks, chunksize=25, sleep_seconds=1):
+
+    records = []
+    chunks = chunk(tracks, chunksize)
+    for ix, track_chunk in enumerate(chunks):
+        logger.info(
+            f"On chunk: [{ix} / {len(chunks)}]  Current num records: [{len(records)}]"
+        )
+        for t in track_chunk:
+            try:
+                matches = spotify_match_track(spotify, t)
+            except spotipy.SpotifyException as e:
+                logger.warn("SpotifyException thrown: [{}]", e)
+                matches = []
+
+            # Empty matches arises from exception above, or just no hits.
+            if not matches:
+                records += [t]
+                continue
+
+            records.extend([t | {f"s_{a}": b for (a, b) in e.items()} for e in matches])
+
+            time.sleep(sleep_seconds)
+
+    return records
+
+
+def select_albums(df, album_threshold=3):
+
+    odf = df.copy()
+    while True:
+
+        # Select album with highest average score.
+        candidate_albums = (
+            odf.loc[lambda f: ~f.album_matched & ~f.album_track_mask]
+            .groupby("s_album_id")
+            .filter(lambda g: len(g) >= album_threshold)
+            .groupby("s_album_id")
+            .s_similarity.agg(["mean", "count"])
+            .sort_values("mean", ascending=False)
+        )
+
+        if not len(candidate_albums):
+            break
+
+        selected_album = candidate_albums.index[0]
+
+        # Mask out tracks that belong to this album (by setting `matched` to
+        # True).
+        subtended_tracks = set(
+            odf.loc[lambda f: f.s_album_id == selected_album].discovery_id.tolist()
+        )
+
+        odf = odf.assign(
+            album_matched=lambda f: f.album_matched | (f.s_album_id == selected_album),
+            album_track_mask=lambda f: f.album_track_mask
+            | f.discovery_id.isin(subtended_tracks),
+        )
+
+    # Assumes we've sorted descending by similarity within track in advance.
+    return odf.assign(
+        nonalbum_track_matched=lambda f: ~f.album_matched
+        & ~f.album_track_mask
+        & f.s_track_id.notnull()
+        & ~f.duplicated(subset="discovery_id", keep="first")
+    )
+
+
 def create_spotify_playlist(
-    spotify, username, track_ids, playlist_id="", batch_size=50
+    spotify, username, tracks_df, playlist_id="", batch_size=50, sleep_seconds=0.50
 ):
 
     if not playlist_id:
@@ -206,15 +380,28 @@ def create_spotify_playlist(
         playlist_id = spotify.user_playlist_create(
             username,
             "SpotifyMatcher",
-            public=False,
+            # public=False,
             description=f"Playlist automatically created by SpotifyMatcher on {date}.",
         )["id"]
 
-    for _ids in chunk(track_ids, batch_size):
+    # Convert albums into tracks.
+    album_track_ids = functools.reduce(
+        lambda a, b: a + b,
+        (
+            [e["id"] for e in spotify.album_tracks(aid)["items"]]
+            for aid in tracks_df.loc[lambda f: f.album_matched]
+            .s_album_id.unique()
+            .tolist()
+        ),
+    )
+
+    nonalbum_track_ids = (
+        tracks_df.loc[lambda f: f.nonalbum_track_matched].s_track_id.unique().tolist()
+    )
+    for _ids in chunk(album_track_ids + nonalbum_track_ids, batch_size):
 
         spotify.user_playlist_add_tracks(username, playlist_id, _ids)
-
-        time.sleep(0.25)
+        time.sleep(sleep_seconds)
 
     return playlist_id
 
@@ -293,25 +480,44 @@ def main(
     tracks = load_track_metadata(music_dir)
     logger.info(f"Discovered [{len(tracks)}] music files.")
 
-    albums, tracks = cluster_albums(tracks)
-    logger.info(
-        f"Discovered [{len(albums)}] albums, "
-        f"leaving [{len(tracks)}] tracks not associated with albums."
-    )
+    # albums, tracks = cluster_albums(tracks)
+    # logger.info(
+    #     f"Discovered [{len(albums)}] albums, "
+    #     f"leaving [{len(tracks)}] tracks not associated with albums."
+    # )
 
     if not use_spotify:
         return
 
     spotify, auth_manager = connect_to_spotify(username, spotify_scope)
 
-    # Search spotify for discovered albums.
-    playlist_track_ids = expand_spotify_albums(spotify, albums) + match_spotify_tracks(
-        spotify, tracks
+    # Search spotify for each track in collection.
+    tracks_df = pd.DataFrame(spotify_batch_match_tracks(spotify, tracks)).assign(
+        album_matched=False, album_track_mask=False
     )
+    logger.info(f"Found [{len(tracks_df)}] potentially-matching tracks at Spotify.")
 
-    create_spotify_playlist(
-        spotify, username, playlist_track_ids, playlist_id=playlist_id
+    # Attempt to fish out whole albums from among matched tracks.
+    tracks_df = select_albums(tracks_df)
+    logger.info(
+        f"Found [{len(tracks_df.loc[lambda f: f.album_matched].s_album_id.unique())}]"
+        " whole albums among tracks."
     )
+    logger.info(
+        f"Found [{len(tracks_df.loc[lambda f: f.nonalbum_track_matched])}]"
+        " matching tracks outside albums."
+    )
+    num_unmatched = sum(
+        ~tracks_df.groupby("discovery_id").apply(
+            lambda f: (f.album_matched | f.nonalbum_track_matched).any()
+        )
+    )
+    logger.info(f"That leaves [{num_unmatched}] unmatched tracks.")
+
+    tracks_df.to_csv("matched-tracks.csv", index=False)
+
+    # Take tracks that match at spotify, but are not associated with an album.
+    create_spotify_playlist(spotify, username, tracks_df, playlist_id=playlist_id)
 
     #     # Needed to get the cached authentication if missing
     #     dummy_search = sp.search("whatever", limit=1)
