@@ -1,6 +1,5 @@
 import datetime
 import functools
-import itertools
 import os
 import shutil
 import time
@@ -13,6 +12,7 @@ import spotipy
 from loguru import logger
 
 
+# Helper functions.
 def chunk(items, size):
     if len(items) <= size:
         return [items]
@@ -52,54 +52,7 @@ def similarity(a, b):
     ) / 2
 
 
-def connect_to_spotify(username, scope):
-    """Used to obtain the auth_manager and establish a connection to Spotify
-    for the given user.
-    Returns (Spotify object, auth_manager)"""
-    auth_manager = spotipy.oauth2.SpotifyOAuth(
-        scope=scope,
-        username=username,
-    )
-
-    spotify = spotipy.Spotify(auth_manager=auth_manager)
-
-    return spotify
-
-
-def album_info(track: dict):
-    return (
-        track.get("album", ""),
-        track.get("artist", ""),
-        # track.get("albumartist", None),
-        track.get("date", ""),
-    )
-
-
-def cluster_albums(tracks, min_tracks=3, same_album_fn=album_info):
-
-    # We guess that a collection "has an album" if it has {min_tracks} tracks
-    # from a given album.
-    matched_albums = [
-        (album, album_tracks)
-        for album, album_tracks in (
-            (album, list(album_tracks))
-            for album, album_tracks in itertools.groupby(
-                (e for e in sorted(tracks, key=same_album_fn) if "album" in e),
-                key=same_album_fn,
-            )
-        )
-        if len(album_tracks) > min_tracks
-    ]
-
-    unmatched_tracks = [
-        track
-        for track in tracks
-        if same_album_fn(track) not in [a for (a, b) in matched_albums]
-    ]
-
-    return matched_albums, unmatched_tracks
-
-
+# Local Files Search
 def is_plausible_music_file(fname):
 
     notmusic_extensions = {".ini", ".jpg", ".bmp", ".m3u", ".db", ".txt"}
@@ -149,65 +102,19 @@ def load_track_metadata(music_dir):
     return tracks
 
 
-def expand_spotify_albums(spotify, albums):
+# Spotify Interaction
+def connect_to_spotify(username, scope):
+    """Used to obtain the auth_manager and establish a connection to Spotify
+    for the given user.
+    Returns (Spotify object, auth_manager)"""
+    auth_manager = spotipy.oauth2.SpotifyOAuth(
+        scope=scope,
+        username=username,
+    )
 
-    track_ids = []
-    for album, album_tracks in sorted(albums, key=lambda e: e[0][-1]):
+    spotify = spotipy.Spotify(auth_manager=auth_manager)
 
-        album_title, artist, date = album
-
-        album_title = album_title[0]
-        artist = artist[0]
-
-        album_result = spotify.search(
-            q=f"artist:{artist} album:{album_title}", type="album"
-        )
-
-        nhits = dig(album_result, "albums", "total")
-        if nhits == 0:
-            logger.info(f"No hits for album [{album}].")
-            continue
-
-        if nhits > 1:
-            logger.info(f"Multiple hits for album [{album}].")
-            continue
-
-        # Look up tracks on matching album.
-        track_ids.extend(
-            [
-                e["id"]
-                for e in spotify.album_tracks(
-                    dig(album_result, "albums", "items", 0, "id")
-                )["items"]
-            ]
-        )
-
-    return track_ids
-
-
-def match_spotify_tracks(spotify, tracks):
-
-    track_ids = []
-    for track in tracks:
-
-        try:
-            track_result = spotify.search(q=f"{dig(track, 'title', 0)}", type="track")
-        except KeyError:
-            logger.info(f"No title available for track [{track}].")
-            continue
-
-        nhits = dig(track_result, "tracks", "total")
-        if nhits == 0:
-            logger.info(f"No hits for track [{track}].")
-            continue
-
-        if nhits > 1:
-            logger.info(f"Multiple hits for track [{track}].")
-            continue
-
-        track_ids.append(dig(track_result, "tracks", "items", 0, "id"))
-
-    return track_ids
+    return spotify
 
 
 SEARCH_PAIRS = (
